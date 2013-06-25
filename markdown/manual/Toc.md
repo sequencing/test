@@ -190,11 +190,11 @@ iSAAC produces a separate bam file for each project/sample.
 
 Pairs where both reads are unaligned are stored depending on the argument of [--keep-unaligned](#isaac-align) command line option.
 
---keep-unaligned|
-----------------|------------------------------------------------------------------------------------------------------
-discard         | Ensures unaligned pairs are not present in the bam file
-front           | Places unaligned pairs in the beginning of the bam file before the first aligned pair of the first chromosome. The iSAAC-generated bam index file is specially crafted to skip those. This approach makes it easier to locate the unaligned clusters compared to the standard implementations which require reading past the last aligned pair of the last chromosome in the genome to locate the first unaligned pair. The drawback is that the standard samtools index command is unable to process such bam files. Be sure to keep the bam index files produced by iSAAC.
-back            | Makes unaligned pairs appear at the end of the bam file. Although this makes it somewhat difficult to extract unaligned data, this is the option that produced bam file that is compatible with samtools index command
+--keep-unaligned|Behavior
+:---------------|:-----------------------------------------------------------------------------------------------------
+discard         |Ensures unaligned pairs are not present in the bam file
+front           |Places unaligned pairs in the beginning of the bam file before the first aligned pair of the first chromosome. The iSAAC-generated bam index file is specially crafted to skip those. This approach makes it easier to locate the unaligned clusters compared to the standard implementations which require reading past the last aligned pair of the last chromosome in the genome to locate the first unaligned pair. The drawback is that the standard samtools index command is unable to process such bam files. Be sure to keep the bam index files produced by iSAAC.
+back            |Makes unaligned pairs appear at the end of the bam file. Although this makes it somewhat difficult to extract unaligned data, this is the option that produced bam file that is compatible with samtools index command
 
 ## Singleton/Shadow pairs
 
