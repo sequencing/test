@@ -4,7 +4,7 @@
 
 ## RAM
 
-When running from Bcl data, for human genome analyses, it is recommended to let iSAAC use 40+ GB of RAM on a 24-threaded 
+When running from Bcl data, for human genome analyses, it is recommended to let iSAAC use at least 40 GB of RAM on a 24-threaded 
 system. See [tweaks](#tweaks) section for ways to run iSAAC on limited hardware.
 
 ## IO
@@ -31,6 +31,63 @@ As the metadata uses absolute paths to reference files, manually copying or movi
 Instead, using the [isaac-pack-reference](#isaac-pack-reference)/[isaac-unpack-reference](#isaac-unpack-reference) tool pair is advised.
 
 In order to prepare a reference from an .fa file, use [isaac-sort-reference](#isaac-sort-reference).
+
+# Examples
+
+**Analyze all data from a bcl run**
+
+    $ isaac-align -r /path/to/sorted-reference.xml -b <Run_Folder>/Data/Intensities/BaseCalls -m 40
+
+**Analyze subset of lanes from a bcl run**
+
+    $ isaac-align -r /path/to/sorted-reference.xml -b <Run_Folder>/Data/Intensities/BaseCalls -m 38 --tiles s_[1234]_
+
+**Analyze paired read data from fastq.gz files**
+
+> **NOTE:** the fastq files need to be named or sym-linked in a special way so that iSAAC can recognize them.
+
+    $ ls Fastq/
+    lane1_read1.fastq.gz  lane1_read2.fastq.gz  lane2_read1.fastq.gz  lane2_read2.fastq.gz
+
+    $ isaac-align -r /path/to/sorted-reference.xml -b Fastq -m 40 --base-calls-format fastq-gz
+
+**Analyze single-ended data from fastq.gz files**
+
+> **NOTE:** that the fastq files need to be named or sym-linked in a special way so that iSAAC can recognize them.
+
+    $ ls Fastq/
+    lane1_read1.fastq.gz  lane2_read1.fastq.gz
+    $ isaac-align -r /path/to/sorted-reference.xml -b Fastq -m 40 --base-calls-format fastq-gz
+
+**Analyze data from bam file**
+
+    $ isaac-align -r /path/to/sorted-reference.xml -b /path/to/my.bam -m 40 --base-calls-format bam
+
+# Output folder structure
+
+    Aligned
+    |-- Projects (output data files)
+    |   |-- <project name>
+    |   |   |-- <sample name>
+    |   |   |   |-- Casava (subset of CASAVA variant calling results data)
+    |   |   |   |-- sorted.bam (bam file for the sample. Contains data for the project/sample from all flowcells)
+    |   |   |   `-- sorted.bam.bai
+    |   |   |-- ...
+    |   `-- ...
+    |-- Reports (navigable statistics pages)
+    |   |-- gif
+    |   |   |-- <flowcell id>
+    |   |   |   `-- all
+    |   |   |       `-- all
+    |   |   |           `-- all
+    |   |   |               |-- <per-tile statistic plot images>
+    |   |   `-- ...
+    |   `-- html
+    |       `-- index.html (root html for the analysis reports)
+    `-- Stats
+        |-- BuildStats.xml (chromosome-level duplicate and coverage statistics)
+        |-- DemultiplexingStats.xml (information about the barcode hits)
+        `-- MatchSelectorStats.xml (tile-level yield, pair and alignment quality statistics)
 
 # Tweaks
 
@@ -64,8 +121,136 @@ in RAM.
 
 Reducing the value **_/proc/sys/vm/swappiness_** to 10 or lower from default 60 solves the problem.
 
-# Toolkit Reference
+# Alignment quality scoring
 
+**Probability of a Correct Read**
+
+This probability is the product of the probability for each base to be correct, as determined by the quality score of 
+the base and the alignment of the base against the reference. If Q[i] is the Phred quality score of a base at position i, 
+we have:
+
+    pBaseError[i] = 10^(-Q[i]/10)
+    pBaseCorrect[i] = 1 - pBaseError[i]
+    pBaseMatch[i] = pBaseCorrect[i]
+    pBaseMismatch[i] = pBaseError[i]/3
+    pReadCorrect = product(i=0..readLength-1, pBase[i]), where pBase[i]is
+        pBaseMatch[i] if the base at position i matches the reference, or is part of an indel
+        pBaseMismatch[i] otherwise
+
+Note: using pBaseMatch[i] for indels is an arbitrary choice (doing otherwise would require a model for indels)
+
+**Alignment Quality of a Single Read**
+
+The alignment quality depends on the intrinsic quality of the alignment (inferred from pReadCorrect above), but also on 
+the specificity of the alignment (i.e. the probability that the read aligns somewhere else). This is inferred from two 
+quantities:
+
+    pNeighbourhood = sum of pReadCorrect for all alignments in the neighbourhood (all other identified alignment positions)
+    rogCorrection = 2*GenomeLength/(4^ReadLength)
+
+The rogCorrection is the "rest-of-genome" correction that gives an indication of the probability of having a random read 
+aligning to the reference. This value tends to (and should) be very small and allows differentiating between the quality 
+of reads with unique alignments (in which case pNeighbourhood == 0).
+
+**iSAAC Accumulates Actual Probablilities in pNeighborhood**
+
+Note that in CASAVA (unlike iSAAC), pNeighborhood is normalized to take into account all the estimated values of 
+pReadCorrect for all the seeds that matched the reference with up-to two mismatches. These estimated values are 
+pessimistic in the sense that they assume that extending the alignment does not introduce any additional mismatches. 
+The assumption is that a seed with one mismatch will lead to an alignment descriptor with exactly one match on the base 
+with the worst quality (using the definition of pReadCorrect given above). Similarly, a seed with two mismatches will 
+lead to an alignment descriptor with exactly two mismatches (on the bases with the two worst qualities).
+
+    pNormalized = rogCorrection + pNeighbourhood
+
+
+finally, the alignment quality is:
+
+    alignmentQuality == -10 * log10(pNormalized/(pNormalized + pReadCorrect))
+
+**Alignment Quality of a Pair**
+
+This is simply the sum of the alignment quality of each fragment when there is exactly one resolved fragment. Otherwise, 
+the alignment score is corrected by the total alignment score of all the resolved fragments:
+
+alignmentQuality = -10 * log(pBestTemplateCorrect / pTotalTemplateCorrect)
+
+where:
+
+    pTemplateCorrect = product(pReadCorrect for all reads)
+    totalRogCorrection = rogCorrection for the total length of all reads
+    pTotalTemplateCorrect = totalRogCorrection + sum(pTemplateCorrect for all resolved templates)
+    pBestTemplateCorrect = max(pTemplateCorrect for all resolved templates)
+
+# Bam files
+
+iSAAC produces a separate bam file for each project/sample.
+
+## Unaligned pairs
+
+Pairs where both reads are unaligned are stored depending on the argument of [--keep-unaligned](#isaac-align) command line option.
+
+--keep-unaligned|
+----------------|------------------------------------------------------------------------------------------------------
+discard         | Ensures unaligned pairs are not present in the bam file
+front           | Places unaligned pairs in the beginning of the bam file before the first aligned pair of the first chromosome. The iSAAC-generated bam index file is specially crafted to skip those. This approach makes it easier to locate the unaligned clusters compared to the standard implementations which require reading past the last aligned pair of the last chromosome in the genome to locate the first unaligned pair. The drawback is that the standard samtools index command is unable to process such bam files. Be sure to keep the bam index files produced by iSAAC.
+back            | Makes unaligned pairs appear at the end of the bam file. Although this makes it somewhat difficult to extract unaligned data, this is the option that produced bam file that is compatible with samtools index command
+
+## Singleton/Shadow pairs
+
+Singleton/shadow pairs refer to pairs in which aligner was unable to decide on the alignment of one of the ends (shadow). 
+In this case, the shadows are assigned the position of the end that does align (singleton). The shadows are stored in the 
+bam file, immediately after their singleton.
+
+## Read names
+
+    read-name     = flowcell-id "_" flowcell-idx ":" lane-number ":" tile-number ":" cluster-id ":0"
+    
+    flowcell-id   = ;flowcell identifier from BaseCalls/config.xml. "unknown-flowcell" if the identifier cannot be 
+                    ;determined from config.xml file
+    flowcell-idx  = ;unique 0-based index of the flowcell within the analysis
+    lane-number   = ;Lane number 1-8
+    tile-number   = ;Unpadded tile number
+    cluster-id    = ;Unpadded 0-based cluster id in the order in which the clusters appear in the bcl tile. 
+
+## Bam flags usage
+Bit  |Description                                            |iSAAC notes
+:----|:------------------------------------------------------|:----------------------------------------------------------
+0x001|template having multiple segments in sequencing        |
+0x002|each segment properly aligned according to the aligner |Pair matches dominant template orientation. Single-ended templates don't have this flag set.
+0x004|segment unmapped                                       |
+0x008|next segment in the template unmapped                  |
+0x010|SEQ being reverse complemented                         |
+0x020|SEQ of the next segment in the template being reversed |
+0x040|the first segment in the template                      |Read 1 (not set for single-ended data)
+0x080|the last segment in the template                       |Read 2
+0x100|secondary alignment                                    |iSAAC does not produce secondary alignments
+0x200|not passing quality controls                           |PF flag from RTA
+0x400|PCR or optical duplicate                               |If [--keep-duplicates](#isaac-align) is turned off, duplicates are excluded from the bam file. If [--mark-duplicates](#isaac-align) is turned off, duplicates are not marked in the bam file.
+
+## Extended tags
+
+iSAAC generates following tags in the output bam files. The list of tags stored can be controlled by --bam-exclude-tags command-line argument.
+
+Tag|iSAAC meaning
+---|:--------------------------------------------------------------------------------
+AS |Pair alignment score
+BC |Barcode string.
+NM |Edit distance (mismatches and gaps) including the soft-clipped parts of the read
+OC |Original CIGAR for the realigned reads. See --realign-gaps.
+RG |iSAAC read groups correspond to flowcell/lane/barcode
+SM |Single read alignment score
+ZX |Cluster X pixel coordinate on the tile times 100 (disabled by default)
+ZY |Cluster Y pixel coordinate on the tile times 100 (disabled by default) 
+
+## MAPQ
+
+Bam MAPQ for pairs that match dominant template orientation is min(max(SM, AS), 60). For reads that are not members of a 
+pair machting the dominant template orientation, the MAPQ is min(SM, 60). The MAPQ might be downgraded to 0 or set to be 
+unknown (255) for alignments that don't have enough evidence to be correctly scored. This behavior depends on the 
+[--dodgy-alignment-score](#isaac-align) argument.
+
+# Toolkit Reference
 
 ## isaac-align
 
@@ -359,26 +544,45 @@ Reducing the value **_/proc/sys/vm/swappiness_** to 10 or lower from default 60 
                                                  :26,27:27,28:28,29:29,30:30,31:31,32:32,33:33,34:34,35:35,36:36,37:37,38:3
                                                  8,39:39,40:40,41:41
 
+## isaac-pack-reference
 
-Option                       | Description
-:----------------------------|:----------------------------------------------------------------------------------------
-  -h [ --help ]              |produce help message and exit
-  -v [ --version ]           |print program version information
-  -b [ --base-calls ] arg    |full path to the base calls directory. Multiple entries allowed.
-  --base-calls-format arg    |Multiple entries allowed. Each entry is applied to the corresponding base-calls. Last entry
-                             | is applied to all --base-calls that don't have --base-calls-format specified.
-                             |  _bam_         : Bam file. All data found in bam file is assumed to come from lane 1 of a 
-                             |                  single flowcell.
-                             |  _bcl_         : common bcl files, no compression.
-                             |  _bcl-gz_      : bcl files are individually compressed and named s_X_YYYY.bcl.gz
-                             |  _fastq_       : One fastq per lane/read named lane<X>_read<Y>.fastq and located directly 
-                             |                  in the specified base-calls. Use lane<X>_read1.fastq for single-ended data.
-                             |  _fastq-gz_    : One compressed fastq per lane/read named lane<X>_read<Y>.fastq.gz and 
-                             |                  located directly in the specified base-calls. Use lane<X>_read1.fastq.gz 
-                             |                  for single-ended data.
+**Usage**
 
+    isaac-pack-reference [options]
+
+**Options**
+
+    -h [ --help ]                                         Print this message
+    -n [ --dry-run ]                                      Don't actually run any commands; just print them
+    -v [ --version ]                                      Only print version information
+    -j [ --jobs ] arg (=1)                                Maximum number of parallel operations
+
+    -r [ --reference-genome ] arg                         Path to sorted-reference.xml 
+    -o [ --output-file ] arg (./packed-reference.tar.gz)  Archive path
+
+**Example**
+
+    /illumina/development/iSAAC/testing/bin/isaac-pack-reference -r HumanUCSC.hg19.complete/sorted-reference.xml -j 24
+
+## isaac-reorder-reference
+
+**Usage**
+
+    isaac-reorder-reference [options]
+
+**Options**
+
+    -h [ --help ]                     produce help message and exit
+    -v [ --version ]                  print program version information
+    -r [ --reference-genome ] arg     Full path to the reference genome XML descriptor.
+    -f [ --output-fasta ] arg         Path for the reordered fasta file.
+    --order arg                       Coma-separated list of contig names in the order in which they will appear in the new
+                                      .fa file.
+    -b [ --bases-per-line ] arg (=70) Number of bases per line to print into .fa file.
+    -x [ --output-xml ] arg           Path for the new xml file.
 
 ## isaac-sort-reference
+
 > **NOTE:** Available RAM could be a concern when sorting big genomes. Human genome reference sorting will require ~150 gigabytes of RAM.
 
 **Usage**
@@ -392,13 +596,43 @@ hours on a 24-threaded 2.6GHz system.
 
 **Options**
 
-Option                                               | Description
-:----------------------------------------------------|:---------------------------------------------------------------------------
--h [ --help ]                                        | Print help message
--n [ --dry-run ]                                     |Don't actually run any commands; just print them
--v [ --version ]                                     |Only print version information
--j [ --jobs ] arg (=1)                               |Maximum number of parallel operations
--w [ --mask-width ] arg (=6)                         |Number of high order bits to use for splitting the data for parallelization
--g [ --genome-file ] arg                             |Path to fasta file containing the reference contigs
--o [ --output-directory ] arg (./iSAACIndex.\<date\>)|Location where the results are stored
+    -g [ --genome-file ] arg                              Path to fasta file containing the reference contigs 
+    -h [ --help ]                                         Print this message
+    -j [ --jobs ] arg (=1)                                Maximum number of parallel operations
+    -n [ --dry-run ]                                      Don't actually run any commands; just print them
+    -o [ --output-directory ] arg (./iSAACIndex.<date>)   Location where the results are stored
+    -q [ --quiet ]                                        Avoid excessive logging
+    -s [ --seed-length ] arg (=32)                        Length of the k-mer. Currently 16-mer, 32-mer and 64-mer sorted 
+                                                          references are supported 
+    -t [ --repeat-threshold ] arg (=1000)                 Repeat cutoff after which individual kmer positions are not 
+                                                          stored
+    -v [ --version ]                                      Only print version information
+    -w [ --mask-width ] arg (=6)                          Number of high order bits to use for splitting the 
+                                                          data for parallelization 
+    --dont-annotate                                       Don't search for neighbors (on by default when 
+                                                          --seed-length is 16)
+    --annotate                                            Force neighbor search (off by default when --seed-length 16)
+
+**Example**
+
+    nohup /illumina/development/iSAAC/latest/bin/isaac-sort-reference -g $(pwd)/Homo_sapiens_assembly19.fasta -j 24&
+
+## isaac-unpack-reference
+
+**Usage**
+
+    isaac-unpack-reference [options]
+
+**Options**
+
+    -h [ --help ]                                         Print this message
+    -n [ --dry-run ]                                      Don't actually run any commands; just print them
+    -v [ --version ]                                      Only print version information
+    -j [ --jobs ] arg (=1)                                Maximum number of parallel operations
+
+    -w [ --mask-width ] arg (=6)                          Number of high order bits to use for splitting the 
+
+    -i [ --input-file ] arg                               Archive path
+    -t [ --repeat-threshold ] arg (=1000)                 Repeat cutoff after which individual kmer positions are not stored
+
 
